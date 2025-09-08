@@ -123,13 +123,13 @@ if __name__ == "__main__":
     DXF_FILENAME = "case_1 v1.dxf"
 
     # 2. 모서리를 따라 찍을 점의 밀도 (값이 클수록 빽빽해짐)
-    POINT_DENSITY = 1.0
+    POINT_DENSITY = 2.0
 
     # 3. 모서리 양옆으로 퍼지는 거리
-    SPREAD = 0.2
+    SPREAD = 1.0
 
     # 4. 최종 점들에 추가될 미세한 노이즈 수준
-    NOISE_LEVEL = 0.02
+    NOISE_LEVEL = 0.3
 
     # 5. 저장할 CSV 파일 이름
     OUTPUT_FILENAME = "dxf_edge_scan_precise.csv"
