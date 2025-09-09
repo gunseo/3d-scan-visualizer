@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-3D 스캔 데이터(CSV)를 불러와 평면을 감지하고 클러스터링하는 스크립트.
+3D 스캔 데이터(CSV) 클러스터링 최종 스크립트 (엄격한 라운드 기반 버전)
 
-작동 순서:
-1. CSV 파일을 읽어 3D 포인트 클라우드를 생성합니다.
-2. 전체 삼각형 메쉬를 구성하되, 각 삼각형의 '출신 슬라이스' 정보를 기록합니다.
-3. 1단계: '같은 출신'의 삼각형들끼리만 먼저 클러스터링하여 '초기 클러스터'를 생성합니다.
-4. 2단계: 생성된 초기 클러스터들을 대상으로, 더 정교한 기준으로 '최종 병합'을 수행합니다.
-5. 최종 클러스터링 결과를 Open3D로 시각화합니다.
+[작동 로직: 엄격한 라운드 기반 순차적 쌍 병합]
+- 각 라운드(Pass)에서는 현재 라운드의 클러스터들만 대상으로 짝을 찾습니다.
+- 한 클러스터는 한 라운드에서 최대 하나의 다른 클러스터와만 병합될 수 있습니다.
+- 병합되어 생성된 새로운 클러스터는 현재 라운드에 참여하지 않고, 다음 라운드의 새로운 '선수'가 됩니다.
+- 이 과정을 더 이상 새로운 쌍이 만들어지지 않을 때까지 반복합니다.
 """
 
 import pandas as pd
@@ -17,9 +16,10 @@ import tkinter as tk
 from tkinter import filedialog
 import open3d as o3d
 from collections import defaultdict
+from tqdm import tqdm
 
 # --------------------------------------------------------------------------
-# 헬퍼 함수 (수정 없음)
+# 섹션 1 & 2: 기본/데이터 준비 함수 (변경 없음)
 # --------------------------------------------------------------------------
 def get_triangle_plane(p1, p2, p3):
     v1 = p2 - p1; v2 = p3 - p1
@@ -29,14 +29,6 @@ def get_triangle_plane(p1, p2, p3):
     normal /= norm_len
     d = -np.dot(normal, p1)
     return normal, d
-
-def are_coplanar(plane1, plane2, angle_deg_tolerance):
-    if plane1 is None or plane2 is None or plane1[0] is None or plane2[0] is None: return False
-    normal1, _ = plane1
-    normal2, _ = plane2
-    dot_product = abs(np.dot(normal1, normal2))
-    min_dot = math.cos(math.radians(angle_deg_tolerance))
-    return dot_product >= min_dot
 
 def fit_plane_pca(points):
     if len(points) < 3: return None, None
@@ -48,248 +40,205 @@ def fit_plane_pca(points):
     d = -np.dot(normal, centroid)
     return normal, d
 
-# --------------------------------------------------------------------------
-# ✨✨ 요청하신 워크플로우에 맞춘 핵심 함수들 ✨✨
-# --------------------------------------------------------------------------
+def load_points_from_csv(file_path):
+    df = pd.read_csv(file_path, header=None)
+    points = []
+    for _, row in df.iterrows():
+        dist, az, el = row.iloc[0], np.radians(row.iloc[1]), np.radians(row.iloc[2])
+        points.append([dist * np.cos(el) * np.cos(az), dist * np.cos(el) * np.sin(az), dist * np.sin(el)])
+    return np.array(points), df
 
 def build_triangles_with_origin(df):
-    """
-    (✨ 수정됨)
-    전체 삼각형과 함께, 각 삼각형이 어떤 'Azimuth 스포크'에서 생성되었는지
-    '출신 정보(origin)'를 함께 반환합니다.
-    """
-    grid = { (int(row.iloc[1]), int(row.iloc[2])): idx for idx, row in df.iterrows() }
-    triangles = []
-    triangle_origins = []
-    
+    grid = {(int(row.iloc[1]), int(row.iloc[2])): idx for idx, row in df.iterrows()}
+    triangles, triangle_origins = [], []
     az_steps = sorted(list(set(df.iloc[:, 1].astype(int))))
     el_steps = sorted(list(set(df.iloc[:, 2].astype(int))))
-    
-    # Azimuth를 기준으로 순회하여 '세로줄'을 같은 출신으로 묶습니다.
     for i, az in enumerate(az_steps):
         az_next = az_steps[(i + 1) % len(az_steps)]
         for j, el in enumerate(el_steps):
             el_next = el_steps[(j + 1) % len(el_steps)]
-            p1, p2 = grid.get((az, el)), grid.get((az_next, el))
-            p3, p4 = grid.get((az, el_next)), grid.get((az_next, el_next))
-            if p1 is not None and p2 is not None and p3 is not None:
-                triangles.append((p1, p2, p3))
-                triangle_origins.append(i) # 출신 정보를 Azimuth 인덱스(i)로 저장
-            if p3 is not None and p2 is not None and p4 is not None:
-                triangles.append((p3, p2, p4))
-                triangle_origins.append(i) # 출신 정보를 Azimuth 인덱스(i)로 저장
-                
+            p1_idx, p2_idx = grid.get((az, el)), grid.get((az_next, el))
+            p3_idx, p4_idx = grid.get((az, el_next)), grid.get((az_next, el_next))
+            if p1_idx is not None and p2_idx is not None and p3_idx is not None:
+                triangles.append((p1_idx, p2_idx, p3_idx)); triangle_origins.append(i)
+            if p3_idx is not None and p2_idx is not None and p4_idx is not None:
+                triangles.append((p3_idx, p2_idx, p4_idx)); triangle_origins.append(i)
     return triangles, triangle_origins
 
 def prepare_mesh_data(points, triangles):
-    """(기존과 동일) 전체 삼각형 목록에 대한 평면 정보와 인접성 그래프를 미리 계산합니다."""
-    triangle_planes = []
-    for tri_indices in triangles:
-        p1, p2, p3 = points[tri_indices[0]], points[tri_indices[1]], points[tri_indices[2]]
-        normal, d = get_triangle_plane(p1, p2, p3)
-        triangle_planes.append((normal, d) if normal is not None else None)
     edge_to_triangles = defaultdict(list)
-    for i, tri_indices in enumerate(triangles):
-        edges = [tuple(sorted(e)) for e in [(tri_indices[0], tri_indices[1]), (tri_indices[1], tri_indices[2]), (tri_indices[2], tri_indices[0])]]
-        for edge in edges:
-            edge_to_triangles[edge].append(i)
+    for i, (p1, p2, p3) in enumerate(triangles):
+        edges = [tuple(sorted(e)) for e in [(p1, p2), (p2, p3), (p3, p1)]]
+        for edge in edges: edge_to_triangles[edge].append(i)
     adjacencies = [[] for _ in range(len(triangles))]
     for edge, tris in edge_to_triangles.items():
         if len(tris) == 2:
-            adjacencies[tris[0]].append(tris[1])
-            adjacencies[tris[1]].append(tris[0])
-    return adjacencies, triangle_planes
+            t1, t2 = tris; adjacencies[t1].append(t2); adjacencies[t2].append(t1)
+    return adjacencies
 
-def cluster_by_origin(triangles, adjacencies, triangle_planes, triangle_origins,
-                      seed_angle_deg, local_angle_deg):
-    """
-    (✨✨ 결정적 오류 수정)
-    1단계: '같은 출신'끼리 클러스터링하되, 평면 계산이 안 되는 삼각형도
-    '단일 클러스터'로 취급하여 절대 누락시키지 않습니다.
-    """
-    visited = [False] * len(triangles)
-    clusters = []
-    
-    # 1. 평면 계산이 가능한 '정상' 삼각형들 먼저 클러스터링
-    for i in range(len(triangles)):
-        if visited[i] or triangle_planes[i] is None: continue
-        
-        seed_plane = triangle_planes[i]
-        origin_idx = triangle_origins[i]
-        
-        stack = [i]
-        visited[i] = True
-        current_cluster = []
-        
-        while stack:
-            curr = stack.pop()
-            current_cluster.append(curr)
-            curr_plane = triangle_planes[curr]
-            if curr_plane is None: continue
+# --------------------------------------------------------------------------
+# 섹션 3: 핵심 클러스터링 알고리즘 (최종 로직)
+# --------------------------------------------------------------------------
+def professional_graph_merge(points, triangles, initial_clusters, initial_graph, angle_deg_tolerance, show_progress=True):
+    """(최종 전문가 버전 + tqdm 최적화) 그래프 엣지 축약 기반의 고성능 클러스터링 함수."""
+    if not initial_clusters: return []
 
-            for nb in adjacencies[curr]:
-                if visited[nb] or triangle_planes[nb] is None: continue
-                
-                if triangle_origins[nb] != origin_idx:
+    cos_thresh = math.cos(math.radians(angle_deg_tolerance))
+    clusters = initial_clusters.copy()
+    graph = {k: v.copy() for k, v in initial_graph.items()}
+    next_cluster_id = max(clusters.keys()) + 1 if clusters else 0
+
+    pass_num = 0
+    while True:
+        pass_num += 1
+        num_clusters = len(clusters)
+        if num_clusters <= 1: break
+        
+        # ✨ 수정된 부분: show_progress가 True일 때만 Pass 시작 메시지 출력
+        if show_progress:
+            print(f"\n--- Pass {pass_num} 시작 (현재 클러스터 개수: {num_clusters}) ---")
+        
+        cluster_ids = sorted(list(clusters.keys()))
+        cluster_planes = {cid: fit_plane_pca(points[list(set(p for t in clusters[cid] for p in triangles[t]))]) for cid in cluster_ids}
+
+        merged_in_pass = set()
+        
+        # ✨ 수정된 부분: show_progress 값에 따라 tqdm을 사용하거나 사용하지 않음
+        iterator = tqdm(cluster_ids, desc=f"  - Pass {pass_num} 진행 중") if show_progress else cluster_ids
+
+        for cid in iterator:
+            if cid in merged_in_pass or cluster_planes[cid][0] is None:
+                continue
+
+            for neighbor_id in list(graph.get(cid, set())):
+                if neighbor_id in merged_in_pass or cluster_planes.get(neighbor_id, (None,))[0] is None:
                     continue
                 
-                cond_seed = are_coplanar(seed_plane, triangle_planes[nb], angle_deg_tolerance=seed_angle_deg)
-                cond_local = are_coplanar(curr_plane, triangle_planes[nb], angle_deg_tolerance=local_angle_deg)
-                if cond_seed and cond_local:
-                    visited[nb] = True
-                    stack.append(nb)
-        clusters.append(current_cluster)
-
-    return clusters
-
-def refine_and_merge_clusters(points, triangles, initial_clusters, adjacencies, 
-                              merge_seed_angle_deg, merge_local_angle_deg):
-    """
-    (✨ 수정됨) 
-    2단계: 초기 클러스터들을 입력받아 seed/local 기준으로 최종 병합을 수행합니다.
-    """
-    if not initial_clusters: return []
-    cluster_avg_planes = {i: fit_plane_pca(points[list(set(v for tri_idx in c for v in triangles[tri_idx]))])
-                          for i, c in enumerate(initial_clusters)}
-    tri_to_cluster_map = {tri_idx: i for i, c in enumerate(initial_clusters) for tri_idx in c}
-    cluster_adjacencies = defaultdict(set)
-    for i, cluster in enumerate(initial_clusters):
-        for tri_idx in cluster:
-            for neighbor_tri in adjacencies[tri_idx]:
-                if neighbor_tri in tri_to_cluster_map:
-                    neighbor_cluster_idx = tri_to_cluster_map[neighbor_tri]
-                    if neighbor_cluster_idx != i:
-                        cluster_adjacencies[i].add(neighbor_cluster_idx)
-                        cluster_adjacencies[neighbor_cluster_idx].add(i)
-    
-    visited_clusters = [False] * len(initial_clusters)
-    final_merged_clusters = []
-    for i in range(len(initial_clusters)):
-        if visited_clusters[i] or cluster_avg_planes.get(i) is None: continue
+                dot_product = abs(np.dot(cluster_planes[cid][0], cluster_planes[neighbor_id][0]))
+                if dot_product >= cos_thresh:
+                    # (엣지 축약 로직은 이전과 동일)
+                    new_id = next_cluster_id; next_cluster_id += 1
+                    clusters[new_id] = clusters[cid] + clusters[neighbor_id]
+                    graph[new_id] = (graph[cid] | graph[neighbor_id]) - {cid, neighbor_id}
+                    for n_id in graph[new_id]:
+                        graph[n_id].discard(cid)
+                        graph[n_id].discard(neighbor_id)
+                        graph[n_id].add(new_id)
+                    del clusters[cid]; del clusters[neighbor_id]
+                    del graph[cid]; del graph[neighbor_id]
+                    merged_in_pass.add(cid); merged_in_pass.add(neighbor_id)
+                    break
         
-        seed_cluster_plane = cluster_avg_planes[i]
-        stack, current_merged_group = [i], []
-        visited_clusters[i] = True
-        
-        while stack:
-            curr_cluster_idx = stack.pop()
-            current_merged_group.extend(initial_clusters[curr_cluster_idx])
-            curr_cluster_plane = cluster_avg_planes[curr_cluster_idx]
-
-            for neighbor_cluster_idx in cluster_adjacencies[curr_cluster_idx]:
-                if visited_clusters[neighbor_cluster_idx] or cluster_avg_planes.get(neighbor_cluster_idx) is None: continue
-                
-                neighbor_plane = cluster_avg_planes[neighbor_cluster_idx]
-                cond_seed = are_coplanar(seed_cluster_plane, neighbor_plane, angle_deg_tolerance=merge_seed_angle_deg)
-                cond_local = are_coplanar(curr_cluster_plane, neighbor_plane, angle_deg_tolerance=merge_local_angle_deg)
-                
-                if cond_seed and cond_local:
-                    visited_clusters[neighbor_cluster_idx] = True
-                    stack.append(neighbor_cluster_idx)
-        final_merged_clusters.append(current_merged_group)
-        
-    return final_merged_clusters
+        if not merged_in_pass:
+            if show_progress:
+                print("\n더 이상 병합할 클러스터가 없어 최종 완료되었습니다.")
+            break
+            
+    return list(clusters.values())
 
 # --------------------------------------------------------------------------
-# 시각화 함수 (수정 없음)
+# 섹션 4: 시각화 함수 (변경 없음)
 # --------------------------------------------------------------------------
 def visualize_without_light(mesh):
-    """조명을 끄고 순수한 정점 색상만 확인하는 함수"""
-    vis = o3d.visualization.Visualizer()
-    vis.create_window()
-    vis.add_geometry(mesh)
-    
-    # 렌더링 옵션을 가져와서 조명 효과(light_on)를 False로 설정
-    opt = vis.get_render_option()
-    opt.light_on = False
-    
-    print("조명을 끄고 시각화합니다. 양면이 모두 같은 색으로 보이는지 확인해 보세요.")
-    vis.run()
-    vis.destroy_window()
-    
-def visualize_with_open3d(points, triangles, clusters):
+    vis = o3d.visualization.Visualizer(); vis.create_window(); vis.add_geometry(mesh)
+    opt = vis.get_render_option(); opt.light_on = False; vis.run(); vis.destroy_window()
+
+def visualize_clusters(points, triangles, clusters):
+    # 각 클러스터에 랜덤 색상 할당 (삼각형 인덱스 기준)
     tri_to_color = {}
     for cluster in clusters:
         color = np.random.rand(3)
         for tri_idx in cluster:
             tri_to_color[tri_idx] = color
             
-    new_points = []
-    new_triangles = []
-    new_vertex_colors = []
+    # 시각화를 위한 메쉬 재생성
+    new_points, new_triangles, new_vertex_colors = [], [], []
     vertex_counter = 0
-    
     for i, tri_indices in enumerate(triangles):
-        color = tri_to_color.get(i, [0.5, 0.5, 0.5])
-        
-        p1 = points[tri_indices[0]]
-        p2 = points[tri_indices[1]]
-        p3 = points[tri_indices[2]]
-        
+        color = tri_to_color.get(i, [0.5, 0.5, 0.5]) # 클러스터에 없으면 회색
+        p1, p2, p3 = points[tri_indices[0]], points[tri_indices[1]], points[tri_indices[2]]
         new_points.extend([p1, p2, p3])
-        new_triangles.append([vertex_counter, vertex_counter + 1, vertex_counter + 2])
-        vertex_counter += 3
+        new_triangles.append([vertex_counter, vertex_counter + 1, vertex_counter + 2]); vertex_counter += 3
         new_vertex_colors.extend([color, color, color])
-        
-    mesh = o3d.geometry.TriangleMesh(
-        o3d.utility.Vector3dVector(np.array(new_points)),
-        o3d.utility.Vector3iVector(np.array(new_triangles))
-    )
-    
-    mesh.vertex_colors = o3d.utility.Vector3dVector(np.array(new_vertex_colors))
-    mesh.compute_vertex_normals()
-    
-    print("Open3D 윈도우를 엽니다. 닫으면 프로그램이 종료됩니다.")
-    visualize_without_light(mesh) 
+    mesh = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(np.array(new_points)), o3d.utility.Vector3iVector(np.array(new_triangles)))
+    mesh.vertex_colors = o3d.utility.Vector3dVector(np.array(new_vertex_colors)); mesh.compute_vertex_normals()
+    visualize_without_light(mesh)
 
 
 # --------------------------------------------------------------------------
-# 메인 실행 함수 (새로운 워크플로우에 맞게 수정됨)
+# 섹션 5: 메인 실행부 (최종 로직에 맞게 수정)
 # --------------------------------------------------------------------------
 def main():
     root = tk.Tk(); root.withdraw()
     file_path = filedialog.askopenfilename(title="CSV 파일을 선택하세요", filetypes=[("CSV files", "*.csv")])
     if not file_path: print("파일이 선택되지 않았습니다."); return
-    df = pd.read_csv(file_path, header=None)
-    
-    points = []
-    for _, row in df.iterrows():
-        dist, az, el = row.iloc[0], np.radians(row.iloc[1]), np.radians(row.iloc[2])
-        points.append([dist*np.cos(el)*np.cos(az), dist*np.cos(el)*np.sin(az), dist*np.sin(el)])
-    points = np.array(points)
 
-    # 1단계: 전체 삼각형과 '출신 정보' 생성
-    print("전체 삼각형 및 출신 정보 생성 중...")
+    points, df = load_points_from_csv(file_path)
     triangles, triangle_origins = build_triangles_with_origin(df)
-    print(f"총 {len(points)}개의 점과 {len(triangles)}개의 삼각형이 생성되었습니다.")
     
-    # 2단계: 전체 메쉬에 대한 '완벽한 지도' 준비
-    print("전체 메쉬 데이터(평면, 인접성) 준비 중...")
-    adjacencies, triangle_planes = prepare_mesh_data(points, triangles)
-
-    # 3단계: '같은 출신'끼리 1차 클러스터링 수행
-    print("1단계: '같은 출신 지역' 내에서 초기 클러스터링 실행 중...")
-    initial_clusters = cluster_by_origin(
-        triangles, adjacencies, triangle_planes, triangle_origins,
-        seed_angle_deg=20, local_angle_deg=20
-    )
-    print(f"초기 클러스터 개수: {len(initial_clusters)}")
+    # --- ✨ 최초의 전체 삼각형 인접성 그래프 생성 (단 한 번만 실행) ---
+    print("최초 인접성 그래프를 생성합니다 (전체 과정 중 한 번만 실행됩니다)...")
+    edge_to_triangles = defaultdict(list)
+    for i, tri in enumerate(tqdm(triangles, desc=" - 그래프 생성")):
+        edges = [tuple(sorted(e)) for e in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])]]
+        for edge in edges: edge_to_triangles[edge].append(i)
     
-    # 4단계: 1차 클러스터들을 대상으로 최종 병합 수행
-    print("2단계: 초기 클러스터들을 대상으로 최종 병합 실행 중...")
-    final_clusters = refine_and_merge_clusters(
-        points, triangles, initial_clusters, adjacencies,
-        merge_seed_angle_deg=20, merge_local_angle_deg=20
-    )
-    print(f"최종 클러스터 개수: {len(final_clusters)}")
+    # 딕셔너리 형태의 그래프 {트라이앵글_id: {이웃_id_1, 이웃_id_2, ...}}
+    adjacency_graph = defaultdict(set)
+    for edge, tris in edge_to_triangles.items():
+        if len(tris) == 2:
+            t1, t2 = tris
+            adjacency_graph[t1].add(t2)
+            adjacency_graph[t2].add(t1)
+    
+    print(f"총 {len(points)}개의 점과 {len(triangles)}개의 삼각형, {len(adjacency_graph)}개의 노드를 가진 그래프 생성 완료.")
 
-    # 5단계: 최종 결과 시각화
+    # --- 1단계: '같은 출신' 내에서 그래프 기반 병합 ---
+    print("\n[1단계] '같은 출신' 그룹 내에서 병합을 시작합니다...")
+    origin_groups = defaultdict(list)
+    for i, origin_id in enumerate(triangle_origins): origin_groups[origin_id].append(i)
+
+    clusters_from_stage1 = []
+    for origin_id, tri_indices in tqdm(origin_groups.items(), desc="1단계 (출신 그룹별) 진행 중"):
+        if not tri_indices: continue
+        
+        group_clusters = {idx: [idx] for idx in tri_indices}
+        group_graph = {idx: {n for n in adjacency_graph.get(idx, set()) if n in group_clusters} for idx in tri_indices}
+        
+        merged = professional_graph_merge(points, triangles, group_clusters, group_graph, 20, show_progress=False)
+        clusters_from_stage1.extend(merged)
+    
+    print(f"\n1단계 결과, 총 {len(clusters_from_stage1)}개의 초기 클러스터가 생성되었습니다.")
+
+    # --- 2단계: 1단계 결과물들을 대상으로 그래프 기반 병합 ---
+    print("\n[2단계] 초기 클러스터들을 대상으로 최종 병합을 시작합니다...")
+    
+    # 2-1. 1단계 결과물들로 새로운 클러스터와 그래프 생성
+    s2_clusters = {i: c for i, c in enumerate(clusters_from_stage1)}
+    tri_to_cid_map = {tri_idx: cid for cid, cluster in s2_clusters.items() for tri_idx in cluster}
+    
+    print("  - 2단계용 인접 그래프를 생성합니다...")
+    s2_graph = defaultdict(set)
+    for cid, cluster in tqdm(s2_clusters.items(), desc="  - 2단계 그래프 생성 중"):
+        for tri_idx in cluster:
+            for neighbor_tri in adjacency_graph.get(tri_idx, set()):
+                neighbor_cid = tri_to_cid_map.get(neighbor_tri)
+                if neighbor_cid is not None and neighbor_cid != cid:
+                    s2_graph[cid].add(neighbor_cid)
+    
+    # 2-2. 최종 병합 실행
+    final_clusters = professional_graph_merge(points, triangles, s2_clusters, s2_graph, 45,show_progress=True)
+    
+    print(f"\n최종 클러스터 {len(final_clusters)}개가 생성되었습니다.")
+
+    # --- 3단계: 시각화 ---
     if final_clusters:
-        print("시각화 준비 중...")
-        visualize_with_open3d(points, triangles, final_clusters)
-    else:
-        print("시각화할 클러스터가 없습니다.")
+        visualize_clusters(points, triangles, final_clusters)
 
 if __name__ == "__main__":
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        print("'tqdm' 라이브러리가 필요합니다. 'pip install tqdm' 명령어로 설치해주세요.")
+        exit()
     main()
-
