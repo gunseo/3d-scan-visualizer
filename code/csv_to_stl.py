@@ -518,7 +518,7 @@ def main():
         if not tri_indices: continue
         group_clusters = {idx: [idx] for idx in tri_indices}
         group_graph = {idx: {n for n in adjacency_graph.get(idx, set()) if n in group_clusters} for idx in tri_indices}
-        merged = professional_graph_merge(points, triangles, group_clusters, group_graph, 10, show_progress=False)
+        merged = professional_graph_merge(points, triangles, group_clusters, group_graph, 5, show_progress=False)
         clusters_from_stage1.extend(merged)
 
     print(f"\n1단계 결과, 총 {len(clusters_from_stage1)}개의 초기 클러스터가 생성되었습니다.")
@@ -526,19 +526,36 @@ def main():
     # --- 6단계: 2차 클러스터링 (전체 클러스터 대상 최종 병합) ---
     print("\n[2단계] 초기 클러스터들을 대상으로 최종 병합을 시작합니다...")
 
+    # 1단계 결과를 기반으로 2단계 클러스터 초기화
     s2_clusters = {i: c for i, c in enumerate(clusters_from_stage1)}
+    # 각 삼각형이 어떤 2단계 클러스터 ID에 속하는지 맵 생성
     tri_to_cid_map = {tri_idx: cid for cid, cluster in s2_clusters.items() for tri_idx in cluster}
 
-    print("  - 2단계용 인접 그래프를 생성합니다...")
+    print("  - 2단계용 인접 그래프를 생성합니다 (★★ 중요: '내부 경계'는 제외)...")
     s2_graph = defaultdict(set)
-    for cid, cluster in tqdm(s2_clusters.items(), desc="  - 2단계 그래프 생성 중"):
-        for tri_idx in cluster:
-            for neighbor_tri in adjacency_graph.get(tri_idx, set()):
-                neighbor_cid = tri_to_cid_map.get(neighbor_tri)
-                if neighbor_cid is not None and neighbor_cid != cid:
-                    s2_graph[cid].add(neighbor_cid)
+    # 모든 삼각형에 대해 원래 인접성을 한 번만 순회하여 그래프를 효율적으로 생성
+    for tri_idx, neighbors in tqdm(adjacency_graph.items(), desc="  - 2단계 그래프 생성 중"):
+        # 중복 계산을 방지하기 위해 인덱스가 더 큰 삼각형과의 관계만 확인
+        if not neighbors: continue
+        
+        cid = tri_to_cid_map.get(tri_idx)
+        if cid is None: continue
 
-    final_clusters = professional_graph_merge(points, triangles, s2_clusters, s2_graph, 10, show_progress=True)
+        for neighbor_tri in neighbors:
+            # 인접 삼각형이 tri_idx보다 작으면 이미 반대편에서 처리했으므로 건너뜀
+            if neighbor_tri < tri_idx: continue
+
+            neighbor_cid = tri_to_cid_map.get(neighbor_tri)
+            if neighbor_cid is None or neighbor_cid == cid: continue
+
+            # ▼▼▼ 핵심 로직 ▼▼▼
+            # 두 삼각형의 '출신(origin)'이 같은 경우, 직접 인접된 삼각형은 절대 병합이 불가능하도록 인접 그래프를 끊어버림.
+            if triangle_origins[tri_idx] != triangle_origins[neighbor_tri]:
+                s2_graph[cid].add(neighbor_cid)
+                s2_graph[neighbor_cid].add(cid)
+            # ▲▲▲ 핵심 로직 ▲▲▲
+
+    final_clusters = professional_graph_merge(points, triangles, s2_clusters, s2_graph, 5, show_progress=True)
     print(f"\n최종 클러스터 {len(final_clusters)}개가 생성되었습니다.")
 
     # --- 7단계: 최종 시각화 ---
