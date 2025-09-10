@@ -1,12 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 3D 스캔 데이터(CSV) 클러스터링 최종 스크립트 (엄격한 라운드 기반 버전)
-
-[작동 로직: 엄격한 라운드 기반 순차적 쌍 병합]
-- 각 라운드(Pass)에서는 현재 라운드의 클러스터들만 대상으로 짝을 찾습니다.
-- 한 클러스터는 한 라운드에서 최대 하나의 다른 클러스터와만 병합될 수 있습니다.
-- 병합되어 생성된 새로운 클러스터는 현재 라운드에 참여하지 않고, 다음 라운드의 새로운 '선수'가 됩니다.
-- 이 과정을 더 이상 새로운 쌍이 만들어지지 않을 때까지 반복합니다.
+- 초기 와이어프레임 시각화 기능 추가
 """
 
 import pandas as pd
@@ -17,6 +12,7 @@ from tkinter import filedialog
 import open3d as o3d
 from collections import defaultdict
 from tqdm import tqdm
+import matplotlib.cm as cm
 
 # --------------------------------------------------------------------------
 # 섹션 1 & 2: 기본/데이터 준비 함수 (변경 없음)
@@ -40,13 +36,72 @@ def fit_plane_pca(points):
     d = -np.dot(normal, centroid)
     return normal, d
 
-def load_points_from_csv(file_path):
+import pandas as pd
+import numpy as np
+
+def load_and_filter_points_from_csv(file_path,min_distance):
+    """
+    CSV를 로드하고 az/el 정렬 후 3D 포인트를 계산합니다.
+    그 다음, 특정 XYZ 좌표 조건에 따라 포인트를 필터링합니다.
+    (z<0 이면서 x^2+y^2 < 35^2 인 점 제거)
+    """
+    # 1. CSV 로드 및 컬럼 이름 지정
     df = pd.read_csv(file_path, header=None)
-    points = []
-    for _, row in df.iterrows():
-        dist, az, el = row.iloc[0], np.radians(row.iloc[1]), np.radians(row.iloc[2])
-        points.append([dist * np.cos(el) * np.cos(az), dist * np.cos(el) * np.sin(az), dist * np.sin(el)])
-    return np.array(points), df
+    df.columns = ['dist', 'az', 'el']
+
+    # 2. 'az'와 'el' 기준으로 정렬
+    sorted_df = df.sort_values(by=['az', 'el'])
+
+     # 3. 정렬된 데이터를 기반으로 3D 좌표 계산
+    dist = sorted_df['dist'].values
+    az_rad = np.radians(sorted_df['az'].values)
+    el_rad = np.radians(sorted_df['el'].values + 90)
+
+    # 먼저, 움직이는 스캐너로부터의 '상대' 좌표를 계산합니다.
+    # (이것이 기존 코드의 계산 방식이었습니다)
+    x_relative = dist * np.cos(el_rad) * np.cos(az_rad)
+    y_relative = dist * np.cos(el_rad) * np.sin(az_rad)
+    z_relative = dist * np.sin(el_rad)
+
+    # --- ▼▼▼ 편심 회전(Eccentric Rotation) 오프셋 보정 ▼▼▼ ---
+    scanner_offset = 58.2
+
+    # 각 포인트가 측정될 당시의 '스캐너 자체의 위치'를 계산합니다.
+    # az_rad는 위에서 이미 계산해두었습니다.
+    scanner_x = scanner_offset * np.cos(az_rad)
+    scanner_y = scanner_offset * np.sin(az_rad)
+    # z_offset은 0이라고 가정합니다 (수평 회전)
+
+    # 최종 실제 좌표 = 스캐너 위치 + 상대 측정 좌표
+    x = scanner_x + x_relative
+    y = scanner_y + y_relative
+    z = z_relative # z 좌표는 변하지 않습니다.
+    # --- ▲▲▲ 보정 완료 ▲▲▲ ---
+
+    # 4. 필터링을 위해 계산된 x, y, z 좌표를 DataFrame에 임시로 추가
+    sorted_df['x'] = x
+    sorted_df['y'] = y
+    sorted_df['z'] = z
+    
+    # --- ▼▼▼ 요청하신 필터링 로직 ▼▼▼ ---
+
+    # 5. 필터링 조건 정의
+    # 제거할 조건: (z가 0보다 작고) AND (x^2 + y^2이 35^2보다 작다)
+    initial_count = len(sorted_df)
+    condition_to_remove = (sorted_df['z'] < 0) & \
+                          (sorted_df['x']**2 + sorted_df['y']**2 < min_distance**2)
+    
+    # 6. 위 조건을 만족하지 않는(~) 행들만 남겨서 필터링 수행
+    filtered_df = sorted_df[~condition_to_remove].copy()
+    
+    print(f"XYZ 필터링: {initial_count}개 -> {len(filtered_df)}개 (z<0 & x²+y²<35² 조건 제외)")
+
+    # 7. 필터링된 DataFrame에서 최종 points 배열 생성
+    #    (x, y, z 컬럼만 선택하여 Numpy 배열로 변환)
+    final_points = filtered_df[['x', 'y', 'z']].to_numpy()
+    
+    # 8. 필터링된 결과 반환 (이때 df는 x,y,z 컬럼을 포함하고 있음)
+    return final_points, filtered_df
 
 def build_triangles_with_origin(df):
     grid = {(int(row.iloc[1]), int(row.iloc[2])): idx for idx, row in df.iterrows()}
@@ -77,7 +132,7 @@ def prepare_mesh_data(points, triangles):
     return adjacencies
 
 # --------------------------------------------------------------------------
-# 섹션 3: 핵심 클러스터링 알고리즘 (최종 로직)
+# 섹션 3: 핵심 클러스터링 알고리즘 (변경 없음)
 # --------------------------------------------------------------------------
 def professional_graph_merge(points, triangles, initial_clusters, initial_graph, angle_deg_tolerance, show_progress=True):
     """(최종 전문가 버전 + tqdm 최적화) 그래프 엣지 축약 기반의 고성능 클러스터링 함수."""
@@ -93,18 +148,15 @@ def professional_graph_merge(points, triangles, initial_clusters, initial_graph,
         pass_num += 1
         num_clusters = len(clusters)
         if num_clusters <= 1: break
-        
-        # ✨ 수정된 부분: show_progress가 True일 때만 Pass 시작 메시지 출력
+
         if show_progress:
             print(f"\n--- Pass {pass_num} 시작 (현재 클러스터 개수: {num_clusters}) ---")
-        
+
         cluster_ids = sorted(list(clusters.keys()))
         cluster_planes = {cid: fit_plane_pca(points[list(set(p for t in clusters[cid] for p in triangles[t]))]) for cid in cluster_ids}
 
         merged_in_pass = set()
-        
-        # ✨ 수정된 부분: show_progress 값에 따라 tqdm을 사용하거나 사용하지 않음
-        iterator = tqdm(cluster_ids, desc=f"  - Pass {pass_num} 진행 중") if show_progress else cluster_ids
+        iterator = tqdm(cluster_ids, desc=f"   - Pass {pass_num} 진행 중") if show_progress else cluster_ids
 
         for cid in iterator:
             if cid in merged_in_pass or cluster_planes[cid][0] is None:
@@ -113,10 +165,9 @@ def professional_graph_merge(points, triangles, initial_clusters, initial_graph,
             for neighbor_id in list(graph.get(cid, set())):
                 if neighbor_id in merged_in_pass or cluster_planes.get(neighbor_id, (None,))[0] is None:
                     continue
-                
+
                 dot_product = abs(np.dot(cluster_planes[cid][0], cluster_planes[neighbor_id][0]))
                 if dot_product >= cos_thresh:
-                    # (엣지 축약 로직은 이전과 동일)
                     new_id = next_cluster_id; next_cluster_id += 1
                     clusters[new_id] = clusters[cid] + clusters[neighbor_id]
                     graph[new_id] = (graph[cid] | graph[neighbor_id]) - {cid, neighbor_id}
@@ -128,20 +179,160 @@ def professional_graph_merge(points, triangles, initial_clusters, initial_graph,
                     del graph[cid]; del graph[neighbor_id]
                     merged_in_pass.add(cid); merged_in_pass.add(neighbor_id)
                     break
-        
+
         if not merged_in_pass:
             if show_progress:
                 print("\n더 이상 병합할 클러스터가 없어 최종 완료되었습니다.")
             break
-            
+
     return list(clusters.values())
 
 # --------------------------------------------------------------------------
-# 섹션 4: 시각화 함수 (변경 없음)
+# 섹션 4: 시각화 함수 (와이어프레임 함수 추가)
 # --------------------------------------------------------------------------
 def visualize_without_light(mesh):
     vis = o3d.visualization.Visualizer(); vis.create_window(); vis.add_geometry(mesh)
-    opt = vis.get_render_option(); opt.light_on = False; vis.run(); vis.destroy_window()
+    opt = vis.get_render_option(); opt.light_on = False; opt.mesh_show_back_face = True; vis.run(); vis.destroy_window()
+    
+
+def visualize_edges_only(points, triangles, show_points=True):
+    """
+    삼각형의 모서리(유일한 에지)만 선으로 시각화.
+    필요하면 점도 함께 찍어줍니다(포인트 클라우드).
+    """
+
+    # 유일한 에지 집합 생성
+    edge_set = set()
+    for a, b, c in triangles:
+        for u, v in ((a, b), (b, c), (c, a)):
+            if u != v:
+                edge_set.add(tuple(sorted((u, v))))
+
+    lines = np.array(list(edge_set), dtype=np.int32)
+
+    # LineSet 구성
+    line_set = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(points),
+        lines=o3d.utility.Vector2iVector(lines)
+    )
+    # (선 색: 검정) 원하면 색 바꿔도 됨
+    line_set.colors = o3d.utility.Vector3dVector(
+        np.tile(np.array([[0.0, 0.0, 0.0]]), (len(lines), 1))
+    )
+
+    # 시각화
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name="Edges-Only (초기 확인용)")
+    vis.add_geometry(line_set)
+    if pcd is not None:
+        vis.add_geometry(pcd)
+
+    opt = vis.get_render_option()
+    opt.light_on = False          # 조명 끔 (선/점만 또렷)
+    opt.point_size = 3.0          # 점 크기
+    try:
+        opt.line_width = 1.5      # 일부 버전에서만 지원
+    except Exception:
+        pass
+
+    vis.run()
+    vis.destroy_window()
+
+def visualize_points_by_distance(points):
+    """
+    포인트 클라우드를 원점(0,0,0)으로부터의 거리에 따라 색을 다르게 하여 시각화합니다.
+    """
+    # 1. 각 점과 원점 사이의 유클리드 거리 계산
+    distances = np.linalg.norm(points, axis=1)
+
+    # 2. 거리를 0과 1 사이의 값으로 정규화 (색상 맵에 매핑하기 위함)
+    # 거리가 모두 동일할 경우 0으로 나눔 에러 방지
+    min_dist, max_dist = np.min(distances), np.max(distances)
+    if min_dist == max_dist:
+        norm_distances = np.zeros_like(distances)
+    else:
+        norm_distances = (distances - min_dist) / (max_dist - min_dist)
+
+    # 3. 정규화된 거리에 viridis 색상 맵을 적용하여 RGB 색상 생성
+    # matplotlib의 colormap을 사용합니다. 다른 맵(예: 'jet', 'plasma')을 사용해도 좋습니다.
+    colors = cm.viridis(norm_distances)[:, :3]  # RGBA에서 RGB 부분만 사용
+
+    # 4. PointCloud 객체 생성
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    # 5. 시각화
+    # 간단한 시각화를 위해 draw_geometries 사용
+    o3d.visualization.draw_geometries(
+        [pcd],
+        window_name="거리에 따라 색상이 지정된 포인트 클라우드"
+    )
+class StatisticalOutlierRemover:
+    """
+    Open3D의 통계적 이상치 제거(statistical outlier removal) 기능을
+    캡슐화한 클래스입니다.
+
+    이 클래스를 사용하면 필터링 파라미터를 객체에 저장해두고
+    여러 포인트 클라우드에 일관되게 적용할 수 있습니다.
+    """
+    def __init__(self, nb_neighbors, std_ratio):
+        """
+        필터 객체를 초기화하고 파라미터를 설정합니다.
+
+        Args:
+            nb_neighbors (int): 각 점의 평균 거리를 계산할 때 고려할 이웃 점의 수.
+            std_ratio (float): 이상치로 간주할 표준 편차의 배수.
+                               값이 작을수록 더 많은 점을 이상치로 제거합니다.
+        """
+        self.nb_neighbors = nb_neighbors
+        self.std_ratio = std_ratio
+        print(f"필터 생성됨: 이웃 수={self.nb_neighbors}, 표준편차 비율={self.std_ratio}")
+
+    def filter(self, pcd):
+        """
+        입력된 포인트 클라우드에 대해 통계적 이상치 제거를 수행합니다.
+
+        Args:
+            pcd (o3d.geometry.PointCloud): 필터링을 적용할 포인트 클라우드 객체.
+
+        Returns:
+            tuple: (filtered_pcd, inlier_indices)
+                - filtered_pcd (o3d.geometry.PointCloud): 이상치가 제거된 포인트 클라우드.
+                - inlier_indices (o3d.utility.IntVector): 원본 포인트 클라우드에서 살아남은 점(inlier)들의 인덱스.
+        """
+        if not isinstance(pcd, o3d.geometry.PointCloud):
+            raise TypeError("입력값은 open3d.geometry.PointCloud 객체여야 합니다.")
+
+        print("이상치 제거 필터링 시작...")
+        # remove_statistical_outlier 함수는 (포인트클라우드, 인덱스) 튜플을 반환합니다.
+        filtered_pcd, ind = pcd.remove_statistical_outlier(
+            nb_neighbors=self.nb_neighbors,
+            std_ratio=self.std_ratio
+        )
+        print(f"필터링 완료: 원본 {len(pcd.points)}개 -> 제거 후 {len(filtered_pcd.points)}개")
+        return filtered_pcd, ind
+
+
+def visualize_wireframe_mesh(points, triangles):
+    """주어진 점과 삼각형으로 구성된 메쉬의 모서리만 보이도록 시각화합니다."""
+    mesh = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(points),
+        o3d.utility.Vector3iVector(np.array(triangles))
+    )
+    mesh.compute_vertex_normals()
+
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name="Initial Mesh Wireframe View")
+    vis.add_geometry(mesh)
+
+    opt = vis.get_render_option()
+    opt.light_on = False
+    opt.mesh_show_wireframe = True  # ✨ 와이어프레임 모드 활성화
+    opt.mesh_show_back_face = True  # 뒷면도 보이도록 설정
+
+    vis.run()
+    vis.destroy_window()
 
 def visualize_clusters(points, triangles, clusters):
     # 각 클러스터에 랜덤 색상 할당 (삼각형 인덱스 기준)
@@ -150,7 +341,7 @@ def visualize_clusters(points, triangles, clusters):
         color = np.random.rand(3)
         for tri_idx in cluster:
             tri_to_color[tri_idx] = color
-            
+
     # 시각화를 위한 메쉬 재생성
     new_points, new_triangles, new_vertex_colors = [], [], []
     vertex_counter = 0
@@ -163,34 +354,67 @@ def visualize_clusters(points, triangles, clusters):
     mesh = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(np.array(new_points)), o3d.utility.Vector3iVector(np.array(new_triangles)))
     mesh.vertex_colors = o3d.utility.Vector3dVector(np.array(new_vertex_colors)); mesh.compute_vertex_normals()
     visualize_without_light(mesh)
-
+    
 
 # --------------------------------------------------------------------------
-# 섹션 5: 메인 실행부 (최종 로직에 맞게 수정)
+# 섹션 5: 메인 실행부 (초기 시각화 로직 적용)
 # --------------------------------------------------------------------------
 def main():
     root = tk.Tk(); root.withdraw()
     file_path = filedialog.askopenfilename(title="CSV 파일을 선택하세요", filetypes=[("CSV files", "*.csv")])
-    if not file_path: print("파일이 선택되지 않았습니다."); return
+    if not file_path: 
+        print("파일이 선택되지 않았습니다.")
+        return
 
-    points, df = load_points_from_csv(file_path)
-    triangles, triangle_origins = build_triangles_with_origin(df)
+    # 1. CSV 파일에서 포인트와 DataFrame 로드
+    points, df = load_and_filter_points_from_csv(file_path, min_distance=400)
+    print(f"초기 데이터 로드 완료: {len(points)}개 포인트")
+
+    # ------------------- 필터 적용 부분 시작 -------------------
+
+    # 2. 로드한 points(Numpy 배열)를 Open3D 포인트 클라우드로 변환
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+
+    # 3. StatisticalOutlierRemover 필터 객체 생성
+    # 파라미터는 데이터에 맞게 조절하세요.
+    sor_filter = StatisticalOutlierRemover(nb_neighbors=500, std_ratio=1.5)
+
+    # 4. 필터 실행하여 이상치 제거
+    # filtered_pcd: 필터링된 포인트 클라우드
+    # inlier_indices: 살아남은 점들의 원본 인덱스
+    filtered_pcd, inlier_indices = sor_filter.filter(pcd)
+
+    # 5. 필터링 결과를 원래 변수들에 다시 반영
+    # points 변수를 필터링된 좌표로 업데이트
+    points = np.asarray(filtered_pcd.points)
     
-    # --- ✨ 최초의 전체 삼각형 인접성 그래프 생성 (단 한 번만 실행) ---
-    print("최초 인접성 그래프를 생성합니다 (전체 과정 중 한 번만 실행됩니다)...")
+    # df 변수를 살아남은 점들(inlier)만 남도록 필터링
+    # inlier_indices를 사용해 원본 df에서 해당하는 행만 선택합니다.
+    df = df.iloc[inlier_indices]
+    
+    # 인덱스를 0부터 다시 정렬하고 싶다면 아래 코드를 추가합니다 (선택 사항).
+    df = df.reset_index(drop=True)
+    
+    print(f"이상치 제거 후: {len(points)}개 포인트")
+    print("\n[초기 확인 단계]")
+    visualize_points_by_distance(points)
+    triangles, triangle_origins = build_triangles_with_origin(df)
+    visualize_wireframe_mesh(points, triangles)
+    # --- 최초의 전체 삼각형 인접성 그래프 생성 (단 한 번만 실행) ---
+    print("\n최초 인접성 그래프를 생성합니다 (전체 과정 중 한 번만 실행됩니다)...")
     edge_to_triangles = defaultdict(list)
     for i, tri in enumerate(tqdm(triangles, desc=" - 그래프 생성")):
         edges = [tuple(sorted(e)) for e in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])]]
         for edge in edges: edge_to_triangles[edge].append(i)
-    
-    # 딕셔너리 형태의 그래프 {트라이앵글_id: {이웃_id_1, 이웃_id_2, ...}}
+
     adjacency_graph = defaultdict(set)
     for edge, tris in edge_to_triangles.items():
         if len(tris) == 2:
             t1, t2 = tris
             adjacency_graph[t1].add(t2)
             adjacency_graph[t2].add(t1)
-    
+
     print(f"총 {len(points)}개의 점과 {len(triangles)}개의 삼각형, {len(adjacency_graph)}개의 노드를 가진 그래프 생성 완료.")
 
     # --- 1단계: '같은 출신' 내에서 그래프 기반 병합 ---
@@ -201,34 +425,32 @@ def main():
     clusters_from_stage1 = []
     for origin_id, tri_indices in tqdm(origin_groups.items(), desc="1단계 (출신 그룹별) 진행 중"):
         if not tri_indices: continue
-        
+
         group_clusters = {idx: [idx] for idx in tri_indices}
         group_graph = {idx: {n for n in adjacency_graph.get(idx, set()) if n in group_clusters} for idx in tri_indices}
-        
+
         merged = professional_graph_merge(points, triangles, group_clusters, group_graph, 20, show_progress=False)
         clusters_from_stage1.extend(merged)
-    
+
     print(f"\n1단계 결과, 총 {len(clusters_from_stage1)}개의 초기 클러스터가 생성되었습니다.")
 
     # --- 2단계: 1단계 결과물들을 대상으로 그래프 기반 병합 ---
     print("\n[2단계] 초기 클러스터들을 대상으로 최종 병합을 시작합니다...")
-    
-    # 2-1. 1단계 결과물들로 새로운 클러스터와 그래프 생성
+
     s2_clusters = {i: c for i, c in enumerate(clusters_from_stage1)}
     tri_to_cid_map = {tri_idx: cid for cid, cluster in s2_clusters.items() for tri_idx in cluster}
-    
-    print("  - 2단계용 인접 그래프를 생성합니다...")
+
+    print("  - 2단계용 인접 그래프를 생성합니다...")
     s2_graph = defaultdict(set)
-    for cid, cluster in tqdm(s2_clusters.items(), desc="  - 2단계 그래프 생성 중"):
+    for cid, cluster in tqdm(s2_clusters.items(), desc="  - 2단계 그래프 생성 중"):
         for tri_idx in cluster:
             for neighbor_tri in adjacency_graph.get(tri_idx, set()):
                 neighbor_cid = tri_to_cid_map.get(neighbor_tri)
                 if neighbor_cid is not None and neighbor_cid != cid:
                     s2_graph[cid].add(neighbor_cid)
-    
-    # 2-2. 최종 병합 실행
-    final_clusters = professional_graph_merge(points, triangles, s2_clusters, s2_graph, 45,show_progress=True)
-    
+
+    final_clusters = professional_graph_merge(points, triangles, s2_clusters, s2_graph, 45, show_progress=True)
+
     print(f"\n최종 클러스터 {len(final_clusters)}개가 생성되었습니다.")
 
     # --- 3단계: 시각화 ---
@@ -240,5 +462,10 @@ if __name__ == "__main__":
         from tqdm import tqdm
     except ImportError:
         print("'tqdm' 라이브러리가 필요합니다. 'pip install tqdm' 명령어로 설치해주세요.")
+        exit()
+    try:
+        import open3d
+    except ImportError:
+        print("'open3d' 라이브러리가 필요합니다. 'pip install open3d' 명령어로 설치해주세요.")
         exit()
     main()
