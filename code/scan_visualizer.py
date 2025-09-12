@@ -10,7 +10,7 @@ def spherical_to_cartesian_numpy(points):
     """구면 좌표계(거리, 방위각, 고도)를 직교 좌표계(x, y, z)로 변환합니다."""
     distance = points[:, 0]
     azimuth_deg = points[:, 1]
-    elevation_deg = points[:, 2]
+    elevation_deg = points[:, 2] + 90
     azimuth_rad = np.radians(azimuth_deg)
     elevation_rad = np.radians(elevation_deg)
     x = distance * np.cos(elevation_rad) * np.cos(azimuth_rad)

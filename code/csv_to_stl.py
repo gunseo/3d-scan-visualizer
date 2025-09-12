@@ -113,6 +113,10 @@ def build_triangles_with_origin(df, points, max_edge_length):
     az_steps = sorted(list(set(df.iloc[:, 1].astype(int))))
     el_steps = sorted(list(set(df.iloc[:, 2].astype(int))))
     
+    # --- ▼▼▼ 수정된 부분 (1/3): 카운터 변수 추가 ▼▼▼ ---
+    potential_triangles = 0
+    discarded_triangles = 0
+    # --- ▲▲▲ 수정 완료 ▲▲▲ ---
     # --- ▼▼▼ 수정된 부분 (1/2): 거리 비교를 위한 제곱값 계산 ▼▼▼ ---
     # 제곱근 계산을 피하기 위해, 길이의 제곱을 기준으로 비교합니다. (계산 속도 향상)
     max_len_sq = max_edge_length ** 2
@@ -137,6 +141,8 @@ def build_triangles_with_origin(df, points, max_edge_length):
                     np.sum((p3-p1)**2) < max_len_sq):
                     triangles.append((p1_idx, p2_idx, p3_idx))
                     triangle_origins.append(i)
+                else:
+                    discarded_triangles += 1
                 # --- ▲▲▲ 수정 완료 ▲▲▲ ---
 
             # 두 번째 삼각형 (p3, p2, p4) 유효성 검사
@@ -148,8 +154,12 @@ def build_triangles_with_origin(df, points, max_edge_length):
                     np.sum((p4-p3)**2) < max_len_sq):
                     triangles.append((p3_idx, p2_idx, p4_idx))
                     triangle_origins.append(i)
+            else:
+                discarded_triangles += 1
                 # --- ▲▲▲ 수정 완료 ▲▲▲ ---
-
+    # --- ▼▼▼ 수정된 부분 (3/3): 결과 프린트 추가 ▼▼▼ ---
+    print(f"\n삼각형 생성 결과: 총 {potential_triangles}개 후보 중 {discarded_triangles}개는 최대 길이({max_edge_length}) 초과로 제외, 최종 {len(triangles)}개 생성됨.")
+    # --- ▲▲▲ 수정 완료 ▲▲▲ ---
     return triangles, triangle_origins
 
 def prepare_mesh_data(points, triangles):
@@ -459,7 +469,7 @@ def main():
         return
 
     # 1. CSV 파일에서 포인트와 DataFrame 로드 (편심 회전 오차 보정 포함)
-    points, df = load_and_filter_points_from_csv(file_path, min_distance=400)
+    points, df = load_and_filter_points_from_csv(file_path, min_distance=200)
     print(f"초기 데이터 로드 완료: {len(points)}개 포인트")
 
     # --- 1단계: 이상치 제거 ---
@@ -489,7 +499,7 @@ def main():
     visualize_points_by_distance(points)
     
     # 균일화된 df와 points를 가지고 삼각형 생성 ('열린 스캔'용으로 수정된 함수 사용)
-    triangles, triangle_origins = build_triangles_with_origin(df, points, max_edge_length=200.0)
+    triangles, triangle_origins = build_triangles_with_origin(df, points, max_edge_length=20000.0)
     visualize_wireframe_mesh(points, triangles)
 
     # --- 4단계: 클러스터링을 위한 그래프 생성 ---
