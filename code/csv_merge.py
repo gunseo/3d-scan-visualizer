@@ -6,6 +6,7 @@ from tkinter import filedialog
 import os
 import copy
 from collections import defaultdict
+from sklearn.cluster import DBSCAN
 
 # =============================================================================
 # 섹션 0: 수동 정렬 및 시각화 도우미 (수정 없음)
@@ -104,6 +105,63 @@ def refine_registration(source, target, initial_transform, fpfh_size):
 # =============================================================================
 # 섹션 2: 데이터 처리 함수 (⭐️⭐️⭐️ 새로 추가/수정된 부분 ⭐️⭐️⭐️)
 # =============================================================================
+def group_blind_spots_with_virtual_scanners(df, voxel_size):
+    """
+    DBSCAN을 사용하여 사각지대 포인트를 클러스터링하고, 각 클러스터에 대해
+    가상 스캐너를 배치하여 새로운 (dist, az, el) 그룹을 생성합니다. (수정된 버전)
+    """
+    print("\n[새 작업] 가상 스캐너 기반 사각지대 그룹핑 시작...")
+
+    blind_spot_df = df[df['status'] == 'blind_spot'].copy()
+    if blind_spot_df.empty:
+        print("-> 분석할 사각지대가 없습니다. 작업을 종료합니다.")
+        return df
+
+    xyz_points = blind_spot_df[['x', 'y', 'z']].values
+
+    dbscan = DBSCAN(eps=voxel_size * 3, min_samples=20)
+    cluster_labels = dbscan.fit_predict(xyz_points)
+    blind_spot_df['cluster_id'] = cluster_labels
+
+    num_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
+    num_noise = np.sum(cluster_labels == -1)
+    print(f"-> DBSCAN 분석 완료: {num_clusters}개의 클러스터와 {num_noise}개의 노이즈 포인트를 찾았습니다.")
+    
+    if num_clusters == 0:
+        print("-> 유의미한 클러스터를 찾지 못했습니다. 작업을 종료합니다.")
+        # cluster_id만 추가된 df를 반환하기 위해 join 사용
+        return df.join(blind_spot_df[['cluster_id']])
+
+    print("-> 각 클러스터의 중심에 가상 스캐너를 배치하고 그룹핑을 시작합니다.")
+    
+    blind_spot_df['virtual_dist'] = np.nan
+    blind_spot_df['virtual_az'] = np.nan
+    blind_spot_df['virtual_el'] = np.nan
+
+    for cluster_id in range(num_clusters):
+        cluster_mask = blind_spot_df['cluster_id'] == cluster_id
+        current_cluster_points = blind_spot_df.loc[cluster_mask, ['x', 'y', 'z']].values
+        
+        virtual_scanner_pos = np.mean(current_cluster_points, axis=0)
+        vectors = current_cluster_points - virtual_scanner_pos
+        
+        dist = np.linalg.norm(vectors, axis=1)
+        az = np.degrees(np.arctan2(vectors[:, 0], vectors[:, 1]))
+        el = np.degrees(np.arcsin(np.clip(vectors[:, 2] / (dist + 1e-9), -1.0, 1.0)))
+        
+        blind_spot_df.loc[cluster_mask, 'virtual_dist'] = dist
+        blind_spot_df.loc[cluster_mask, 'virtual_az'] = az
+        blind_spot_df.loc[cluster_mask, 'virtual_el'] = el
+        print(f"  -> 클러스터 {cluster_id} 처리 완료. ({len(current_cluster_points)}개 포인트)")
+
+    # ⭐️⭐️⭐️ 수정된 부분: df.update() 대신 더 안정적인 df.join() 사용 ⭐️⭐️⭐️
+    # 업데이트할 열 목록
+    update_cols = ['cluster_id', 'virtual_dist', 'virtual_az', 'virtual_el']
+    # blind_spot_df의 계산 결과를 원본 df의 인덱스를 기준으로 안전하게 병합
+    result_df = df.join(blind_spot_df[update_cols])
+    
+    print("✅ 사각지대 그룹핑 완료.")
+    return result_df
 def load_all_scans_to_dataframe(file_paths):
     """
     모든 CSV 파일을 하나의 Pandas DataFrame으로 통합 로딩합니다.
@@ -162,51 +220,62 @@ def apply_transforms_to_dataframe(df, transforms):
     print("-> 모든 포인트에 변환 행렬 적용 완료.")
     return df_transformed
 
-def optimal_voxel_partitioning(df, voxel_size):
+def find_blind_spots(df, voxel_size, reference_scanner_id=0):
     """
-    Voxel 내 포인트 개수를 기준으로 Owner Scanner와 Azimuth 정보를 결정합니다.
-    (transforms 파라미터는 더 이상 필요하지 않습니다.)
-    """
-    print("\n[3/4] Voxel 기반 공간 분할 (개선된 방식) 시작...")
-    
-    # 각 포인트가 어떤 Voxel에 속하는지 계산
-    # 이 과정은 법선 벡터 계산이 필요 없으므로 앞으로 이동 가능
-    df['voxel_index'] = [tuple(idx) for idx in np.floor(df[['x', 'y', 'z']].values / voxel_size).astype(int)]
-    
-    # Voxel별로 포인트 인덱스 그룹화
-    voxel_to_points = df.groupby('voxel_index').groups
-    print(f"-> {len(voxel_to_points)}개의 고유 Voxel 생성됨.")
+    정합된 전체 포인트 클라우드에서 기준 스캐너의 사각지대를 찾습니다.
 
-    results = []
+    Args:
+        df (pd.DataFrame): 변환이 모두 적용된 전체 포인트 데이터.
+        voxel_size (float): 공간을 나눌 Voxel의 크기.
+        reference_scanner_id (int): 기준이 될 스캐너의 ID (기본값: 0).
+
+    Returns:
+        o3d.geometry.PointCloud: 사각지대가 시각화된 포인트 클라우드 객체.
+                                 (초록색: 기준 스캐너 영역, 빨간색: 사각지대)
+    """
+    print(f"\n[새 작업] 기준 스캐너({reference_scanner_id})의 사각지대 분석 시작...")
+
+    # 1. 모든 점에 대해 Voxel 인덱스 부여
+    df['voxel_index'] = [tuple(idx) for idx in np.floor(df[['x', 'y', 'z']].values / voxel_size).astype(int)]
+
+    # 2. 전체 공간을 차지하는 Voxel과 기준 스캐너가 차지하는 Voxel 계산
+    all_occupied_voxels = set(df['voxel_index'])
+    print(f"-> 총 {len(all_occupied_voxels)}개의 Voxel에 포인트가 존재합니다.")
     
-    for voxel_index, point_indices in voxel_to_points.items():
-        voxel_points_df = df.loc[point_indices]
-        
-        # Voxel 내에 포인트가 없는 경우 건너뛰기
-        if voxel_points_df.empty:
-            continue
-            
-        # Voxel 내에서 스캐너 ID별로 포인트 개수를 계산
-        scanner_counts = voxel_points_df['scanner_id'].value_counts()
-        
-        # 포인트가 가장 많은 스캐너를 Owner로 결정
-        best_scanner = scanner_counts.idxmax()
-        
-        # Owner 스캐너가 생성한 포인트들의 Azimuth 정보 수집
-        owner_points_df = voxel_points_df[voxel_points_df['scanner_id'] == best_scanner]
-        azimuths = sorted(owner_points_df['az'].unique().tolist())
-        
-        voxel_center = (np.array(voxel_index) + 0.5) * voxel_size
-        results.append({
-            'voxel_center_x': voxel_center[0], 
-            'voxel_center_y': voxel_center[1], 
-            'voxel_center_z': voxel_center[2],
-            'owner_scanner_id': best_scanner, 
-            'contributing_azimuths': str(azimuths)
-        })
-        
-    print(f"-> {len(results)}개 Voxel의 주인 결정 완료.")
-    return pd.DataFrame(results)
+    ref_scanner_voxels = set(df[df['scanner_id'] == reference_scanner_id]['voxel_index'])
+    print(f"-> 기준 스캐너({reference_scanner_id})는 이 중 {len(ref_scanner_voxels)}개의 Voxel을 포함합니다.")
+
+    # 3. 사각지대 Voxel 계산 (차집합)
+    blind_spot_voxels = all_occupied_voxels - ref_scanner_voxels
+    print(f"-> 계산된 사각지대 Voxel 개수: {len(blind_spot_voxels)}")
+
+    # 4. 시각화를 위해 각 포인트에 색상 정보 부여
+    # Voxel 인덱스를 키로, 상태('covered' 또는 'blind_spot')를 값으로 하는 딕셔너리 생성
+    voxel_status_map = {voxel: 'covered' for voxel in ref_scanner_voxels}
+    voxel_status_map.update({voxel: 'blind_spot' for voxel in blind_spot_voxels})
+
+    # 모든 포인트에 Voxel 상태를 매핑
+    df['status'] = df['voxel_index'].map(voxel_status_map)
+
+    # 최종 포인트 클라우드 생성
+    pcd_final = o3d.geometry.PointCloud()
+    pcd_final.points = o3d.utility.Vector3dVector(df[['x', 'y', 'z']].values)
+
+    # 상태에 따라 색상 지정
+    point_colors = np.zeros_like(df[['x', 'y', 'z']].values)
+    
+    # 기준 스캐너가 커버하는 영역의 포인트 (초록색)
+    covered_mask = (df['status'] == 'covered')
+    point_colors[covered_mask] = [0.1, 0.8, 0.2]  # Green
+
+    # 사각지대 영역의 포인트 (빨간색)
+    blind_spot_mask = (df['status'] == 'blind_spot')
+    point_colors[blind_spot_mask] = [1.0, 0.2, 0.1]  # Red
+    
+    pcd_final.colors = o3d.utility.Vector3dVector(point_colors)
+    print("-> 시각화 준비 완료. 초록색: 기준 스캐너, 빨간색: 사각지대")
+
+    return pcd_final,df
 class StatisticalOutlierRemover:
     """
     Open3D의 통계적 이상치 제거(statistical outlier removal) 기능을
@@ -341,33 +410,65 @@ if __name__ == "__main__":
         # ⭐️ 변환 행렬은 깨끗한 데이터프레임에 적용합니다.
         transformed_df = apply_transforms_to_dataframe(master_df_cleaned, final_transforms)
 
-        # --- 4단계 -> 5단계: Voxel 기반 공간 분할 및 저장/시각화 ---
-        print("\n[5/5] Voxel 기반 공간 분할, 저장 및 시각화...")
-        results_df = optimal_voxel_partitioning(transformed_df, voxel_size)
+        # --- 5단계: 사각지대 분석, 그룹핑 및 시각화 ---
+        print("\n[5/5] 사각지대 분석 및 그룹핑 시작...")
         
-        # (이하 저장 및 시각화 코드는 기존과 동일)
-        output_dir = "final_voxel_results"
+        # 1. 사각지대 분석 (초록/빨강 시각화)
+        # 이제 함수가 (pcd, df) 튜플을 반환
+        pcd_with_blind_spots, transformed_df_with_status = find_blind_spots(
+            transformed_df, voxel_size, reference_scanner_id=0
+        )
+
+        print("-> 1차 결과: 사각지대 분석 결과 (초록: 기준 스캐너, 빨강: 사각지대)")
+        o3d.visualization.draw_geometries(
+            [pcd_with_blind_spots],
+            window_name="1. 사각지대 분석 결과"
+        )
+
+        # 2. 가상 스캐너 기반 그룹핑 수행
+        final_df = group_blind_spots_with_virtual_scanners(
+            transformed_df_with_status, voxel_size
+        )
+
+        # 3. 그룹핑 결과 시각화 (클러스터별 색상)
+        print("-> 2차 결과: 클러스터링 기반 그룹핑 결과 시각화")
+        
+        pcd_clustered = o3d.geometry.PointCloud()
+        pcd_clustered.points = o3d.utility.Vector3dVector(final_df[['x', 'y', 'z']].values)
+        
+        # 색상 준비
+        colors = np.zeros_like(final_df[['x', 'y', 'z']].values)
+        
+        # 기준 스캐너가 본 점들은 회색으로 표시
+        covered_mask = final_df['status'] == 'covered'
+        colors[covered_mask] = [0.7, 0.7, 0.7]
+
+        # 클러스터별로 랜덤 색상 지정
+        cluster_ids = final_df['cluster_id'].dropna().unique()
+        cluster_ids = cluster_ids[cluster_ids != -1] # 노이즈(-1) 제외
+        
+        palette = np.random.rand(len(cluster_ids), 3)
+
+        for i, cid in enumerate(cluster_ids):
+            cluster_mask = final_df['cluster_id'] == cid
+            colors[cluster_mask] = palette[i]
+            
+        # 노이즈 포인트는 검은색으로 표시
+        noise_mask = final_df['cluster_id'] == -1
+        colors[noise_mask] = [0, 0, 0]
+
+        pcd_clustered.colors = o3d.utility.Vector3dVector(colors)
+
+        o3d.visualization.draw_geometries(
+            [pcd_clustered],
+            window_name="2. 가상 스캐너 그룹핑 결과 (색상=클러스터)"
+        )
+
+        # 최종 데이터프레임을 CSV로 저장 (옵션)
+        output_dir = "final_grouped_results"
         if not os.path.exists(output_dir): os.makedirs(output_dir)
-        output_filename = os.path.join(output_dir, "voxel_ownership_with_azimuth.csv")
-        results_df.to_csv(output_filename, index=False)
-        print(f"-> 최종 Voxel 결과 저장 완료: '{output_filename}'")
-
-        pcd_final = o3d.geometry.PointCloud()
-        pcd_final.points = o3d.utility.Vector3dVector(transformed_df[['x', 'y', 'z']].values)
-        
-        voxel_owner_map = results_df.set_index(results_df.apply(
-            lambda row: tuple(np.floor(row[['voxel_center_x', 'voxel_center_y', 'voxel_center_z']].values / voxel_size).astype(int)), axis=1
-        ))['owner_scanner_id'].to_dict()
-
-        point_colors = np.zeros_like(transformed_df[['x', 'y', 'z']].values)
-        partition_colors = np.random.rand(len(file_paths), 3)
-        
-        owner_ids = transformed_df['voxel_index'].map(voxel_owner_map).fillna(-1).astype(int)
-        valid_indices = owner_ids != -1
-        point_colors[valid_indices] = partition_colors[owner_ids[valid_indices]]
-        
-        pcd_final.colors = o3d.utility.Vector3dVector(point_colors)
-        
-        o3d.visualization.draw_geometries([pcd_final], window_name="Voxel 기반 공간 분할 결과")
+        output_filename = os.path.join(output_dir, "grouped_blind_spot_data.csv")
+        final_df.to_csv(output_filename, index=False, encoding='utf-8-sig')
+        print(f"-> 최종 그룹핑 결과 CSV 저장 완료: '{output_filename}'")
         
         print("\n✨ 모든 작업이 완료되었습니다.")
